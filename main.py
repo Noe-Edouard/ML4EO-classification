@@ -22,13 +22,22 @@ class Trainer:
     def __init__(self, args: argparse.Namespace):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.args = args
-        self.model = smp.Segformer(
-        encoder_name="mit_b2",  # backbone size: b0, b1, b2, etc.
-        encoder_weights="imagenet",  # pretrained weights
-        in_channels=244,  # e.g. 4+10 bands
-        classes=18,  # LCZ classes
-        activation=None  # we'll use raw logits + CrossEntropyLoss
-        ).to(self.device)
+        
+        if args.model == "randomforest":
+            self.model = RandomForestSegmentation(
+                n_estimators=args.n_estimators,
+                max_depth=args.max_depth
+            )
+            self.optimizer = None  # Pas nécessaire
+            self.scheduler = None
+        else:
+            self.model = smp.Segformer(
+                encoder_name="mit_b2",
+                encoder_weights="imagenet",
+                in_channels=in_chans_for_model,
+                classes=18,
+                activation=None
+            ).to(self.device)
 
         self.experiment_folder = new_log(os.path.join(args.save_dir, args.dataset),
                                                                           args)[0]
@@ -54,28 +63,86 @@ class Trainer:
         pass
 
     def train(self):
-        with tqdm(range(self.epoch, self.args.num_epochs), leave=True) as tnr:
-            tnr.set_postfix(training_loss=np.nan, validation_loss=np.nan, best_validation_loss=np.nan)
-            for _ in tnr:
-                self.train_epoch(tnr)
-
-                if (self.epoch + 1) % self.args.val_every_n_epochs == 0:
-                    self.validate()
-
-                self.scheduler.step()
-
-                """
-                if self.args.save_model in ['last', 'both']:
-                    self.save_model('last')
-
-                if self.args.lr_scheduler == 'step':
+        if self.args.model == "randomforest":
+            self.train_randomforest()
+        else:
+            with tqdm(range(self.epoch, self.args.num_epochs), leave=True) as tnr:
+                tnr.set_postfix(training_loss=np.nan, validation_loss=np.nan, best_validation_loss=np.nan)
+                for _ in tnr:
+                    self.train_epoch(tnr)
+    
+                    if (self.epoch + 1) % self.args.val_every_n_epochs == 0:
+                        self.validate()
+    
                     self.scheduler.step()
-                    if self.use_wandb:
-                        wandb.log({'log_lr': np.log10(self.scheduler.get_last_lr())}, self.iter)
-                    else:
-                        self.writer.add_scalar('log_lr', np.log10(self.scheduler.get_last_lr()), self.epoch)
-                """
-                self.epoch += 1
+    
+                    """
+                    if self.args.save_model in ['last', 'both']:
+                        self.save_model('last')
+    
+                    if self.args.lr_scheduler == 'step':
+                        self.scheduler.step()
+                        if self.use_wandb:
+                            wandb.log({'log_lr': np.log10(self.scheduler.get_last_lr())}, self.iter)
+                        else:
+                            self.writer.add_scalar('log_lr', np.log10(self.scheduler.get_last_lr()), self.epoch)
+                    """
+                    self.epoch += 1
+
+
+    def train_randomforest(self):
+        print("Training Random Forest...")
+        X_all, y_all = [], []
+    
+        for batch in tqdm(self.dataloaders['train'], desc="Extracting features"):
+            images = batch["image"].numpy()  # (B, C, H, W)
+            labels = batch["label"].numpy()  # (B, H, W)
+            images = np.transpose(images, (0, 2, 3, 1))  # → (B, H, W, C)
+            X_all.append(images)
+            y_all.append(labels)
+    
+        X_all = np.concatenate(X_all, axis=0)
+        y_all = np.concatenate(y_all, axis=0)
+    
+        self.model.fit(X_all, y_all)  # fit (N, H, W, C) and (N, H, W)
+    
+        print("Evaluating Random Forest...")
+        self.validate_randomforest()
+
+    def validate_randomforest(self):
+        X_val, y_val = [], []
+        for batch in tqdm(self.dataloaders['val'], desc="Validating"):
+            images = batch["image"].numpy()
+            labels = batch["label"].numpy()
+            images = np.transpose(images, (0, 2, 3, 1))  # (B, H, W, C)
+    
+            X_val.append(images)
+            y_val.append(labels)
+    
+        X_val = np.concatenate(X_val, axis=0)
+        y_val = np.concatenate(y_val, axis=0)
+    
+        preds = self.model.predict(X_val)  # (N, H, W)
+    
+        y_pred = preds.ravel()
+        y_true = y_val.ravel()
+        present_labels = np.unique(y_true)
+    
+        print(classification_report(
+            y_true, y_pred,
+            labels=present_labels,
+            target_names=[f"LCZ_{i}" for i in present_labels],
+            zero_division=0
+        ))
+    
+        acc = accuracy_score(y_true, y_pred)
+        ious = jaccard_score(y_true, y_pred, labels=present_labels, average=None, zero_division=0)
+        mean_iou = ious.mean()
+    
+        print(f"Pixel Accuracy: {acc:.4f}")
+        print(f"Mean IoU      : {mean_iou:.4f}")
+
+    
 
     def train_epoch(self, tnr=None):
         self.train_stats = defaultdict(float)
