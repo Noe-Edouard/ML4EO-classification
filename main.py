@@ -21,13 +21,20 @@ class Trainer:
         self.device = torch.device("cpu")
         print("Forcing device to CPU as CUDA is not available or enabled.") 
         in_chans_for_model = 453#245 
-        self.model = smp.Segformer(
-            encoder_name="mit_b2",
-            encoder_weights="imagenet",
-            in_channels=in_chans_for_model, 
-            classes=18, # Or 17 if that's the correct number of LCZ classes
-            activation=None
-        ).to(self.device)
+
+        if args.model == "randomforest":
+            self.model = RandomForestSegmentation(
+                n_estimators=200,
+                max_depth=20
+            )
+        else:
+            self.model = smp.Segformer(
+                encoder_name="mit_b2",
+                encoder_weights="imagenet",
+                in_channels=in_chans_for_model, 
+                classes=18, # Or 17 if that's the correct number of LCZ classes
+                activation=None
+            ).to(self.device)
 
         self.args = args
         self.experiment_folder = new_log(os.path.join(args.save_dir, args.dataset),
@@ -55,17 +62,74 @@ class Trainer:
         pass
 
     def train(self):
-        with tqdm(range(self.epoch, self.args.num_epochs), leave=True) as tnr:
-            tnr.set_postfix(training_loss=np.nan, validation_loss=np.nan, best_validation_loss=np.nan)
-            for _ in tnr:
-                self.train_epoch(tnr)
+        if self.args.model == "randomforest":
+            self.train_randomforest()
+        else:
+            with tqdm(range(self.epoch, self.args.num_epochs), leave=True) as tnr:
+                tnr.set_postfix(training_loss=np.nan, validation_loss=np.nan, best_validation_loss=np.nan)
+                for _ in tnr:
+                    self.train_epoch(tnr)
+    
+                    if (self.epoch + 1) % self.args.val_every_n_epochs == 0:
+                        self.validate()
+    
+                    self.scheduler.step()
+    
+                    self.epoch += 1
 
-                if (self.epoch + 1) % self.args.val_every_n_epochs == 0:
-                    self.validate()
+    def train_randomforest(self):
+        print("Training Random Forest...")
+        X_all, y_all = [], []
+    
+        for batch in tqdm(self.dataloaders['train'], desc="Extracting features"):
+            images = batch["image"].numpy()  # (B, C, H, W)
+            labels = batch["label"].numpy()  # (B, H, W)
+            images = np.transpose(images, (0, 2, 3, 1))  # → (B, H, W, C)
+            X_all.append(images)
+            y_all.append(labels)
+    
+        X_all = np.concatenate(X_all, axis=0)
+        y_all = np.concatenate(y_all, axis=0)
+    
+        self.model.fit(X_all, y_all)  # fit (N, H, W, C) and (N, H, W)
+    
+        print("Evaluating Random Forest...")
+        self.validate_randomforest()
 
-                self.scheduler.step()
+    def validate_randomforest(self):
+        X_val, y_val = [], []
+        for batch in tqdm(self.dataloaders['val'], desc="Validating"):
+            images = batch["image"].numpy()
+            labels = batch["label"].numpy()
+            images = np.transpose(images, (0, 2, 3, 1))  # (B, H, W, C)
+    
+            X_val.append(images)
+            y_val.append(labels)
+    
+        X_val = np.concatenate(X_val, axis=0)
+        y_val = np.concatenate(y_val, axis=0)
+    
+        preds = self.model.predict(X_val)  # (N, H, W)
+    
+        y_pred = preds.ravel()
+        y_true = y_val.ravel()
+        present_labels = np.unique(y_true)
+    
+        print(classification_report(
+            y_true, y_pred,
+            labels=present_labels,
+            target_names=[f"LCZ_{i}" for i in present_labels],
+            zero_division=0
+        ))
+    
+        acc = accuracy_score(y_true, y_pred)
+        ious = jaccard_score(y_true, y_pred, labels=present_labels, average=None, zero_division=0)
+        mean_iou = ious.mean()
+    
+        print(f"Pixel Accuracy: {acc:.4f}")
+        print(f"Mean IoU      : {mean_iou:.4f}")
 
-                self.epoch += 1
+
 
     def train_epoch(self, tnr=None):
         self.train_stats = defaultdict(float)
